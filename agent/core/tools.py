@@ -404,6 +404,15 @@ def create_builtin_tools(
     if not enable_hf_infra:
         tools = [t for t in tools if t.name not in HF_INFRA_TOOL_NAMES]
 
+    # The `research` tool spawns a subagent that calls `litellm.acompletion`
+    # directly — it needs ANTHROPIC_API_KEY and bypasses SDKBackend. On the
+    # SDK backend it silently hangs at 0 tokens because no API key is set.
+    # Claude Code's builtin `Task` tool (inherits the main session's
+    # `claude login` auth) is a drop-in replacement, so drop ours on the
+    # SDK path.
+    if use_sdk_builtins:
+        tools = [t for t in tools if t.name != RESEARCH_TOOL_SPEC["name"]]
+
     # Sandbox or local tools (highest priority)
     if local_mode and not use_sdk_builtins:
         from agent.tools.local_tools import get_local_tools
