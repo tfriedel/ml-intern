@@ -15,7 +15,7 @@ After Spikes 1–3 established feasibility, the three throwaway drivers were mer
 4. **This doc** — consolidation.
 5. [`spike-4-findings.md`](./spike-4-findings.md) — long-run + compaction controls. Headline: SDK defaults to Opus 4.7 with 1M context, auto-compact threshold at 967k. `/compact` and `DISABLE_AUTO_COMPACT=1` verified; `ClaudeSDKClient` (not `query()`) is the right primitive for the migration.
 6. [`spike-5-findings.md`](./spike-5-findings.md) — local training smoke test. Headline: end-to-end PASS. Agent trained SmolLM-135M on a local JSONL, 3 bash calls, 0 hf_jobs calls, real checkpoint on disk, 59s / $0.34.
-7. *(pending)* `spike-6-findings.md` — cancellation / interruption.
+7. [`spike-6-findings.md`](./spike-6-findings.md) — cancellation / interruption. Headline: SDK `interrupt()` mechanism is solid (aborts turns in ~5ms, session survives). BUT `_bash_handler`'s synchronous `subprocess.run` leaks orphan processes — fix in the full migration by deleting it and re-enabling the SDK Bash builtin.
 
 ## What `SDKBackend` does
 
