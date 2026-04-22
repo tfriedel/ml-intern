@@ -41,12 +41,19 @@ from agent.core.session import Event
 class SDKEventAdapter:
     """Streams SDK messages into an ml-intern-style asyncio event queue."""
 
-    def __init__(self, event_queue: asyncio.Queue):
+    def __init__(self, event_queue: asyncio.Queue, own_mcp_server: str = "ml-intern"):
         self.q = event_queue
+        # Name of the in-process MCP server we register our own tools under.
+        # Used to scope the `ready` tool count to ml-intern-own tools,
+        # separately from Claude Code builtins and user's other MCP plugins.
+        self._own_mcp_server = own_mcp_server
         # Tool name lookup so tool_output events can include the tool name
         # (ml-intern emits `{"tool": name, "tool_call_id": id, ...}` but the
         # SDK's ToolResultBlock only carries `tool_use_id`, not the name).
         self._tool_names: dict[str, str] = {}
+        # IDs of tool uses whose tool_output should be dropped (e.g. the
+        # SDK's internal ToolSearch hop — see `_handle_assistant`).
+        self._suppressed_tool_ids: set[str] = set()
         # Buffer partial text between AssistantMessage boundaries so we
         # emit exactly one `assistant_message` per completed text block.
         self._streaming_open = False
@@ -77,12 +84,29 @@ class SDKEventAdapter:
 
     async def _handle_system(self, msg: SystemMessage) -> None:
         if msg.subtype == "init":
-            # ml-intern's `ready` event carries tool_count; the SDK's init
-            # payload has `tools` (list of tool names).
+            # SDK reports ALL tools available: Claude Code builtins
+            # (Bash/Read/Edit/TodoWrite/WebFetch/…), any MCP plugins the
+            # user has installed (Asana, Gmail, Notion, Sentry, …), AND
+            # our ml-intern MCP server. Count only our own so the `ready`
+            # event matches the user's mental model.
             tools = msg.data.get("tools") or []
+            own = [
+                t for t in tools
+                if t.startswith(f"mcp__{self._own_mcp_server}__")
+            ]
+            other_mcp = [
+                t for t in tools
+                if t.startswith("mcp__") and t not in own
+            ]
+            builtin = [t for t in tools if not t.startswith("mcp__")]
             await self._emit(
                 "ready",
-                {"message": "Agent initialized", "tool_count": len(tools)},
+                {
+                    "message": "Agent initialized",
+                    "tool_count": len(own),
+                    "builtin_tool_count": len(builtin),
+                    "other_mcp_tool_count": len(other_mcp),
+                },
             )
         elif msg.subtype == "compact_boundary":
             # The SDK fires this when it compacts. Mirror ml-intern's shape.
@@ -125,6 +149,12 @@ class SDKEventAdapter:
                 # ml-intern has no thinking event today; skip (could add).
                 continue
             elif isinstance(block, ToolUseBlock):
+                # Drop the SDK's ToolSearch discovery hop — it's an
+                # internal MCP-resolution step, not a user-visible tool
+                # call. (Spike 3 finding.)
+                if block.name == "ToolSearch":
+                    self._suppressed_tool_ids.add(block.id)
+                    continue
                 self._tool_names[block.id] = block.name
                 await self._emit(
                     "tool_call",
@@ -151,6 +181,9 @@ class SDKEventAdapter:
             return
         for block in content or []:
             if isinstance(block, ToolResultBlock):
+                if block.tool_use_id in self._suppressed_tool_ids:
+                    self._suppressed_tool_ids.discard(block.tool_use_id)
+                    continue
                 tool_name = self._tool_names.get(block.tool_use_id, "unknown")
                 output = _flatten_tool_result(block.content)
                 await self._emit(

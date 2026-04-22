@@ -1,0 +1,405 @@
+"""
+Claude Agent SDK backend for ml-intern.
+
+Replaces the litellm LLM call at the heart of `Handlers.run_agent` with
+the Claude Agent SDK's `query()`. Reuses:
+  * ml-intern tool handlers (via an in-process SDK MCP server)
+  * `_needs_approval()` (via the SDK's `can_use_tool` callback)
+  * `SDKEventAdapter` (streams SDK messages onto ml-intern's event queue)
+
+Consolidates the patterns proven in Spikes 1–3. Not yet wired into the
+CLI — `demo()` at the bottom runs the spike scenarios to smoke-test the
+module end-to-end.
+
+Usage sketch (for when we wire it into `agent/main.py`):
+
+    backend = SDKBackend(
+        tool_specs=tool_router.tools,
+        event_queue=session.event_queue,
+        config=session.config,
+        session=session,
+    )
+    summary = await backend.run_turn("fine-tune SmolLM on /tmp/my-data")
+"""
+
+from __future__ import annotations
+
+import asyncio
+import inspect
+import logging
+import sys
+from typing import Any, Awaitable, Callable, Iterable
+
+from claude_agent_sdk import (
+    ClaudeAgentOptions,
+    PermissionResultAllow,
+    PermissionResultDeny,
+    SdkMcpTool,
+    ToolPermissionContext,
+    create_sdk_mcp_server,
+    query,
+    tool,
+)
+
+from agent.core.agent_loop import _needs_approval
+from agent.core.sdk_event_adapter import SDKEventAdapter, _strip_mcp_prefix
+from agent.core.session import Event
+
+logger = logging.getLogger(__name__)
+
+
+# Claude Code's built-in tools are disabled so ml-intern's tool-name-based
+# approval and prompts remain authoritative. Bash/Read/Write/Edit have
+# higher-quality builtin implementations (Spike 1 finding) but switching
+# to them changes which tools the approval callback sees. Revisit once
+# we decide whether to delete `agent/tools/local_tools.py`.
+DEFAULT_DISALLOWED_BUILTINS: list[str] = ["Bash", "Read", "Write", "Edit"]
+
+
+# ── Tool factory: ToolSpec → SdkMcpTool ────────────────────────────────
+
+
+def _call_handler(
+    handler: Callable[..., Awaitable[tuple[str, bool]]],
+    args: dict[str, Any],
+    session: Any | None,
+    tool_call_id: str | None,
+) -> Awaitable[tuple[str, bool]]:
+    """Invoke a ToolSpec handler regardless of which of the three signature
+    variants it uses. Mirrors the dispatch in ToolRouter.call_tool.
+    """
+    sig = inspect.signature(handler)
+    kwargs: dict[str, Any] = {}
+    if "session" in sig.parameters or _accepts_kwargs(sig):
+        kwargs["session"] = session
+    if "tool_call_id" in sig.parameters or _accepts_kwargs(sig):
+        kwargs["tool_call_id"] = tool_call_id
+    return handler(args, **kwargs)
+
+
+def _accepts_kwargs(sig: inspect.Signature) -> bool:
+    return any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+    )
+
+
+def make_sdk_tool_from_spec(
+    spec: Any,  # ToolSpec (avoid circular import on Session-building order)
+    session_provider: Callable[[], Any | None],
+) -> SdkMcpTool:
+    """Wrap one ml-intern ToolSpec as an in-process SDK MCP tool.
+
+    The SDK gives the handler only `args` at call time (no tool_use_id,
+    no session). We close over a `session_provider` so the handler can
+    still get at the live session object — and we forward `tool_call_id`
+    when available via a contextvar-style stash populated by
+    `can_use_tool` (see `SDKBackend._set_current_tool_call_id`).
+    """
+    handler = spec.handler
+
+    @tool(
+        name=spec.name,
+        description=spec.description,
+        input_schema=spec.parameters,
+    )
+    async def _wrapped(args: dict[str, Any]) -> dict[str, Any]:
+        # Strip empty fields so the handler sees the same shape it does
+        # in the litellm path (LLM tool-use JSON only carries populated
+        # fields, but the SDK fills every declared schema key).
+        clean = {k: v for k, v in args.items() if v not in (None, "", [])}
+        session = session_provider()
+        tool_call_id = _current_tool_call_id.get(None) if session else None
+        try:
+            output, ok = await _call_handler(handler, clean, session, tool_call_id)
+        except Exception as e:  # noqa: BLE001 — convert to tool error
+            logger.exception("Handler %s raised", spec.name)
+            return {
+                "content": [{"type": "text", "text": f"Tool error: {e}"}],
+                "is_error": True,
+            }
+        return {
+            "content": [{"type": "text", "text": output}],
+            "is_error": not ok,
+        }
+
+    return _wrapped
+
+
+# Used by the permission callback to stash the tool_use_id so the tool
+# handler can retrieve it. Simpler than threading through the SDK.
+import contextvars  # noqa: E402
+
+_current_tool_call_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "ml_intern_sdk_current_tool_call_id", default=None
+)
+
+
+# ── Permission callback ───────────────────────────────────────────────
+
+
+def make_permission_callback(
+    event_queue: asyncio.Queue,
+    config: Any | None,
+    deny_all_sensitive: bool = False,
+    await_user_decision: (
+        Callable[[str, dict[str, Any], str | None], Awaitable[bool]] | None
+    ) = None,
+) -> Callable[
+    [str, dict[str, Any], ToolPermissionContext],
+    Awaitable[PermissionResultAllow | PermissionResultDeny],
+]:
+    """Build a `can_use_tool` callback that enforces ml-intern's rules.
+
+    - Stashes tool_use_id in a contextvar so the tool handler can see it.
+    - Delegates approval decisions to `_needs_approval(name, args, config)`.
+    - Emits `approval_required` + `tool_state_change` events onto the
+      shared queue.
+    - If `await_user_decision` is given, awaits it to decide; otherwise
+      either allows everything (default) or denies all sensitive calls
+      (if `deny_all_sensitive=True`, useful for scripted demos/tests).
+    """
+
+    async def cb(
+        tool_name: str,
+        tool_args: dict[str, Any],
+        ctx: ToolPermissionContext,
+    ) -> PermissionResultAllow | PermissionResultDeny:
+        bare = _strip_mcp_prefix(tool_name)
+
+        # Make the tool_use_id visible to the tool handler.
+        if ctx.tool_use_id:
+            _current_tool_call_id.set(ctx.tool_use_id)
+
+        needs = _needs_approval(bare, tool_args, config=config)
+        if not needs:
+            return PermissionResultAllow(behavior="allow")
+
+        # Ask the user (or the scripted decider).
+        await event_queue.put(Event(
+            event_type="approval_required",
+            data={
+                "tools": [{
+                    "tool": bare,
+                    "arguments": tool_args,
+                    "tool_call_id": ctx.tool_use_id,
+                }],
+                "count": 1,
+            },
+        ))
+
+        if await_user_decision is not None:
+            approved = await await_user_decision(bare, tool_args, ctx.tool_use_id)
+        else:
+            approved = not deny_all_sensitive
+
+        await event_queue.put(Event(
+            event_type="tool_state_change",
+            data={
+                "tool_call_id": ctx.tool_use_id,
+                "tool": bare,
+                "state": "approved" if approved else "rejected",
+            },
+        ))
+
+        if approved:
+            return PermissionResultAllow(behavior="allow")
+        return PermissionResultDeny(
+            behavior="deny",
+            message=(
+                f"User denied approval for `{bare}` "
+                f"(operation={tool_args.get('operation')})."
+            ),
+            interrupt=False,
+        )
+
+    return cb
+
+
+# ── Top-level façade ──────────────────────────────────────────────────
+
+
+class SDKBackend:
+    """Drives the Claude Agent SDK against ml-intern's tools + events.
+
+    Swap-in replacement for the litellm LLM-call section of
+    `Handlers.run_agent`. Does NOT replace the submission loop, session
+    bookkeeping, context-manager persistence, or approval-batching —
+    those stay in `agent/core/agent_loop.py` for now.
+    """
+
+    def __init__(
+        self,
+        tool_specs: Iterable[Any],
+        event_queue: asyncio.Queue,
+        config: Any | None = None,
+        session: Any | None = None,
+        system_prompt: str | None = None,
+        max_turns: int = 50,
+        deny_all_sensitive: bool = False,
+        await_user_decision: (
+            Callable[[str, dict[str, Any], str | None], Awaitable[bool]] | None
+        ) = None,
+    ):
+        self.event_queue = event_queue
+        self.config = config
+        self.session = session
+        self.system_prompt = system_prompt
+        self.max_turns = max_turns
+        self.adapter = SDKEventAdapter(event_queue)
+
+        # Build in-process MCP server from the ml-intern tool specs.
+        sdk_tools = [
+            make_sdk_tool_from_spec(spec, session_provider=lambda: self.session)
+            for spec in tool_specs
+        ]
+        self._server = create_sdk_mcp_server(
+            name="ml-intern",
+            version="0.0.1",
+            tools=sdk_tools,
+        )
+        self._tool_names = [spec.name for spec in tool_specs]
+        self._permission_cb = make_permission_callback(
+            event_queue=event_queue,
+            config=config,
+            deny_all_sensitive=deny_all_sensitive,
+            await_user_decision=await_user_decision,
+        )
+
+    def _build_options(self) -> ClaudeAgentOptions:
+        return ClaudeAgentOptions(
+            system_prompt=self.system_prompt,
+            mcp_servers={"ml-intern": self._server},
+            # NB: NOT setting `allowed_tools` — that would pre-approve
+            # and bypass `can_use_tool` (Spike 2 gotcha).
+            disallowed_tools=DEFAULT_DISALLOWED_BUILTINS,
+            can_use_tool=self._permission_cb,
+            include_partial_messages=True,
+            max_turns=self.max_turns,
+        )
+
+    async def run_turn(self, user_message: str) -> dict[str, Any]:
+        """Run one user turn and stream events onto the queue."""
+        options = self._build_options()
+
+        async def prompt_stream():
+            yield {
+                "type": "user",
+                "message": {"role": "user", "content": user_message},
+            }
+
+        return await self.adapter.consume(
+            query(prompt=prompt_stream(), options=options)
+        )
+
+
+# ── Smoke-test demo ────────────────────────────────────────────────────
+#
+# Replaces the three previous spike drivers. Runs the scenarios against
+# a minimal tool registration (bash + hf_jobs) without bringing up a
+# real Session / ToolRouter / ContextManager.
+
+
+def _build_demo_tool_specs():
+    from dataclasses import dataclass
+
+    from agent.tools.jobs_tool import HF_JOBS_TOOL_SPEC, hf_jobs_handler
+    from agent.tools.local_tools import _bash_handler
+
+    @dataclass
+    class ToolSpec:
+        name: str
+        description: str
+        parameters: dict
+        handler: Callable
+
+    bash = ToolSpec(
+        name="bash",
+        description="Execute a shell command locally.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "command": {"type": "string"},
+                "work_dir": {"type": "string"},
+                "timeout": {"type": "integer"},
+            },
+            "required": ["command"],
+        },
+        handler=_bash_handler,
+    )
+    hf_jobs = ToolSpec(
+        name=HF_JOBS_TOOL_SPEC["name"],
+        description=HF_JOBS_TOOL_SPEC["description"],
+        parameters=HF_JOBS_TOOL_SPEC["parameters"],
+        handler=hf_jobs_handler,
+    )
+    return [bash, hf_jobs]
+
+
+SCENARIOS: dict[str, tuple[str, bool]] = {
+    "bash": ("Use `bash` to print the current date.", False),
+    "deny": (
+        "Submit a GPU job with hf_jobs (operation=run, "
+        "hardware_flavor=t4-small, script='print(1)', timeout='5m'). "
+        "If denied, just report it.",
+        True,
+    ),
+    "mix": (
+        "First use `bash` to print the current date. Then list HF jobs "
+        "with hf_jobs operation=ps.",
+        False,
+    ),
+}
+
+
+async def _drain_and_print(q: asyncio.Queue, done: asyncio.Event) -> None:
+    import json
+    while not (done.is_set() and q.empty()):
+        try:
+            event = await asyncio.wait_for(q.get(), timeout=0.1)
+        except asyncio.TimeoutError:
+            continue
+        print(
+            f"[event] {event.event_type} "
+            f"{json.dumps(event.data, default=str)[:220]}",
+            flush=True,
+        )
+
+
+async def _run_demo(scenario: str) -> None:
+    import json
+    prompt, deny = SCENARIOS.get(scenario, (scenario, False))
+    print(f"\n>>> prompt: {prompt}\n", flush=True)
+
+    q: asyncio.Queue = asyncio.Queue()
+    backend = SDKBackend(
+        tool_specs=_build_demo_tool_specs(),
+        event_queue=q,
+        config=None,
+        session=None,
+        system_prompt=(
+            "You are a terse assistant. Prefer single tool calls. "
+            "If a tool is denied, report it and do not retry."
+        ),
+        max_turns=6,
+        deny_all_sensitive=deny,
+    )
+
+    done = asyncio.Event()
+    drain_task = asyncio.create_task(_drain_and_print(q, done))
+    try:
+        summary = await backend.run_turn(prompt)
+    finally:
+        done.set()
+        await drain_task
+
+    print("\n--- result summary ---", flush=True)
+    print(json.dumps(summary, default=str, indent=2))
+
+
+def demo() -> None:
+    scenario = sys.argv[1] if len(sys.argv) > 1 else "mix"
+    asyncio.run(_run_demo(scenario))
+
+
+if __name__ == "__main__":
+    demo()
