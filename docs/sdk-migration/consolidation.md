@@ -13,7 +13,7 @@ After Spikes 1–3 established feasibility, the three throwaway drivers were mer
 2. [`spike-2-findings.md`](./spike-2-findings.md) — `can_use_tool` permission callback, `_needs_approval` reuse. Gotchas: `allowed_tools` pre-approves and bypasses the callback; streaming mode is required.
 3. [`spike-3-findings.md`](./spike-3-findings.md) — `SDKEventAdapter` mapping SDK messages to ml-intern's Event queue. Surprises: `ToolSearch` pollution, inflated `tool_count`, `ResultMessage` is a goldmine.
 4. **This doc** — consolidation.
-5. *(pending)* `spike-4-findings.md` — long-run / compaction behavior.
+5. [`spike-4-findings.md`](./spike-4-findings.md) — long-run + compaction. Headline: SDK handled 311k cached tokens without compacting — ml-intern's 190k compactor can be deleted.
 6. *(pending)* `spike-5-findings.md` — local training smoke test.
 7. *(pending)* `spike-6-findings.md` — cancellation / interruption.
 
