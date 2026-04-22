@@ -33,6 +33,13 @@ class Config(BaseModel):
     confirm_cpu_jobs: bool = True
     auto_file_upload: bool = False
 
+    # Register HF remote-infrastructure tools (hf_jobs, sandbox_*, hf_repo_files,
+    # hf_repo_git). Defaults to True to preserve the current litellm-path
+    # behavior. The local-first SDK backend flips this to False by default so
+    # the agent trains locally and only reaches for HF infra when the user
+    # explicitly passes `--enable-hf-infra`.
+    enable_hf_infra: bool = True
+
     # Reasoning effort for models that support it (GPT-5 / o-series, Claude
     # extended thinking, HF reasoning models like MiniMax M2 / Kimi K2).
     # Defaults to "high" — we'd rather spend tokens thinking than ship a

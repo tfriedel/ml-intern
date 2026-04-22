@@ -914,7 +914,7 @@ def _handle_slash_command(
     return None
 
 
-async def main():
+async def main(enable_hf_infra: bool | None = None):
     """Interactive chat with the agent"""
 
     # Clear screen
@@ -956,8 +956,16 @@ async def main():
     config_path = Path(__file__).parent.parent / "configs" / "main_agent_config.json"
     config = load_config(config_path)
 
+    if enable_hf_infra is not None:
+        config.enable_hf_infra = enable_hf_infra
+
     # Create tool router with local mode
-    tool_router = ToolRouter(config.mcpServers, hf_token=hf_token, local_mode=True)
+    tool_router = ToolRouter(
+        config.mcpServers,
+        hf_token=hf_token,
+        local_mode=True,
+        enable_hf_infra=config.enable_hf_infra,
+    )
 
     # Session holder for interrupt/model/status access
     session_holder = [None]
@@ -1139,6 +1147,7 @@ async def headless_main(
     model: str | None = None,
     max_iterations: int | None = None,
     stream: bool = True,
+    enable_hf_infra: bool | None = None,
 ) -> None:
     """Run a single prompt headlessly and exit."""
     import logging
@@ -1162,15 +1171,24 @@ async def headless_main(
     if max_iterations is not None:
         config.max_iterations = max_iterations
 
+    if enable_hf_infra is not None:
+        config.enable_hf_infra = enable_hf_infra
+
     print(f"Model: {config.model_name}", file=sys.stderr)
     print(f"Max iterations: {config.max_iterations}", file=sys.stderr)
+    print(f"HF infra tools: {'on' if config.enable_hf_infra else 'off'}", file=sys.stderr)
     print(f"Prompt: {prompt}", file=sys.stderr)
     print("---", file=sys.stderr)
 
     submission_queue: asyncio.Queue = asyncio.Queue()
     event_queue: asyncio.Queue = asyncio.Queue()
 
-    tool_router = ToolRouter(config.mcpServers, hf_token=hf_token, local_mode=True)
+    tool_router = ToolRouter(
+        config.mcpServers,
+        hf_token=hf_token,
+        local_mode=True,
+        enable_hf_infra=config.enable_hf_infra,
+    )
     session_holder: list = [None]
 
     agent_task = asyncio.create_task(
@@ -1341,6 +1359,26 @@ def cli():
                         help="Max LLM requests per turn (default: 50, use -1 for unlimited)")
     parser.add_argument("--no-stream", action="store_true",
                         help="Disable token streaming (use non-streaming LLM calls)")
+    hf_infra = parser.add_mutually_exclusive_group()
+    hf_infra.add_argument(
+        "--enable-hf-infra",
+        dest="enable_hf_infra",
+        action="store_true",
+        default=None,
+        help=(
+            "Expose HF remote-infra tools (hf_jobs, sandbox_*, hf_repo_files, "
+            "hf_repo_git). Overrides the config default."
+        ),
+    )
+    hf_infra.add_argument(
+        "--no-hf-infra",
+        dest="enable_hf_infra",
+        action="store_false",
+        help=(
+            "Hide HF remote-infra tools and train/run locally only. "
+            "Overrides the config default."
+        ),
+    )
     args = parser.parse_args()
 
     try:
@@ -1348,9 +1386,17 @@ def cli():
             max_iter = args.max_iterations
             if max_iter is not None and max_iter < 0:
                 max_iter = 10_000  # effectively unlimited
-            asyncio.run(headless_main(args.prompt, model=args.model, max_iterations=max_iter, stream=not args.no_stream))
+            asyncio.run(
+                headless_main(
+                    args.prompt,
+                    model=args.model,
+                    max_iterations=max_iter,
+                    stream=not args.no_stream,
+                    enable_hf_infra=args.enable_hf_infra,
+                )
+            )
         else:
-            asyncio.run(main())
+            asyncio.run(main(enable_hf_infra=args.enable_hf_infra))
     except KeyboardInterrupt:
         print("\n\nGoodbye!")
 

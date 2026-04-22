@@ -129,11 +129,19 @@ class ToolRouter:
     Based on codex-rs/core/src/tools/router.rs
     """
 
-    def __init__(self, mcp_servers: dict[str, MCPServerConfig], hf_token: str | None = None, local_mode: bool = False):
+    def __init__(
+        self,
+        mcp_servers: dict[str, MCPServerConfig],
+        hf_token: str | None = None,
+        local_mode: bool = False,
+        enable_hf_infra: bool = True,
+    ):
         self.tools: dict[str, ToolSpec] = {}
         self.mcp_servers: dict[str, dict[str, Any]] = {}
 
-        for tool in create_builtin_tools(local_mode=local_mode):
+        for tool in create_builtin_tools(
+            local_mode=local_mode, enable_hf_infra=enable_hf_infra
+        ):
             self.register_tool(tool)
 
         self.mcp_client: Client | None = None
@@ -279,8 +287,28 @@ class ToolRouter:
 # ============================================================================
 
 
-def create_builtin_tools(local_mode: bool = False) -> list[ToolSpec]:
-    """Create built-in tool specifications"""
+# Tools that use HF remote infrastructure (compute or writes to the Hub).
+# Filtered out when `enable_hf_infra=False` (the local-first default for the
+# SDK backend).
+HF_INFRA_TOOL_NAMES: set[str] = {
+    HF_JOBS_TOOL_SPEC["name"],
+    HF_REPO_FILES_TOOL_SPEC["name"],
+    HF_REPO_GIT_TOOL_SPEC["name"],
+}
+
+
+def create_builtin_tools(
+    local_mode: bool = False, enable_hf_infra: bool = True
+) -> list[ToolSpec]:
+    """Create built-in tool specifications.
+
+    Args:
+        local_mode: run bash/read/write/edit locally (True) vs. on an HF
+            Space sandbox (False). Unchanged from before.
+        enable_hf_infra: when False, drop tools that submit HF Jobs, create
+            sandboxes, or write to the Hub. Read-only HF tools
+            (hf_inspect_dataset, hf_papers, explore_hf_docs, …) are kept.
+    """
     # in order of importance
     tools = [
         # Research sub-agent (delegates to read-only tools in independent context)
@@ -363,12 +391,19 @@ def create_builtin_tools(local_mode: bool = False) -> list[ToolSpec]:
         ),
     ]
 
+    # Drop HF remote-infra tools when disabled. Runs before the sandbox/local
+    # choice so we also skip the sandbox branch (remote compute) below.
+    if not enable_hf_infra:
+        tools = [t for t in tools if t.name not in HF_INFRA_TOOL_NAMES]
+
     # Sandbox or local tools (highest priority)
     if local_mode:
         from agent.tools.local_tools import get_local_tools
         tools = get_local_tools() + tools
-    else:
+    elif enable_hf_infra:
         tools = get_sandbox_tools() + tools
+    # else: no local_mode and no HF infra → caller supplies bash/file tools
+    # itself (e.g. SDK backend relying on Claude Code builtins).
 
     tool_names = ", ".join([t.name for t in tools])
     logger.info(f"Loaded {len(tools)} built-in tools: {tool_names}")
