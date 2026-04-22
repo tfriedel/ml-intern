@@ -399,6 +399,12 @@ async def event_listener(
     console = _create_rich_console()
     shimmer = _ThinkingShimmer(console)
     stream_buf = _StreamBuffer(console)
+    # Tracks whether `assistant_chunk` already rendered the current
+    # assistant turn. If so, the follow-up `assistant_message` carries the
+    # same content and we skip it to avoid double-rendering. Reset on
+    # every turn_complete, tool_call (new assistant turn coming), and
+    # interrupted.
+    assistant_streamed = [False]
 
     def _cancel_event():
         """Return the session's cancellation Event so print_markdown can abort
@@ -416,12 +422,18 @@ async def event_listener(
                 ready_event.set()
             elif event.event_type == "assistant_message":
                 shimmer.stop()
+                # If we already streamed chunks for this turn, the full
+                # `assistant_message` is a duplicate — skip it.
+                if assistant_streamed[0]:
+                    assistant_streamed[0] = False
+                    continue
                 content = event.data.get("content", "") if event.data else ""
                 if content:
                     await print_markdown(content, cancel_event=_cancel_event())
             elif event.event_type == "assistant_chunk":
                 content = event.data.get("content", "") if event.data else ""
                 if content:
+                    assistant_streamed[0] = True
                     stream_buf.add_chunk(content)
                     # Flush any complete markdown blocks progressively so the
                     # user sees paragraphs appear as they're produced, not just
@@ -434,6 +446,10 @@ async def event_listener(
             elif event.event_type == "tool_call":
                 shimmer.stop()
                 stream_buf.discard()
+                # A new assistant turn begins here; `assistant_message` that
+                # may still arrive (pre-tool-call text) is not a duplicate
+                # of what streamed for the previous turn.
+                assistant_streamed[0] = False
                 tool_name = event.data.get("tool", "") if event.data else ""
                 arguments = event.data.get("arguments", {}) if event.data else {}
                 if tool_name:
@@ -452,12 +468,14 @@ async def event_listener(
             elif event.event_type == "turn_complete":
                 shimmer.stop()
                 stream_buf.discard()
+                assistant_streamed[0] = False
                 print_turn_complete()
                 print_plan()
                 turn_complete_event.set()
             elif event.event_type == "interrupted":
                 shimmer.stop()
                 stream_buf.discard()
+                assistant_streamed[0] = False
                 print_interrupted()
                 turn_complete_event.set()
             elif event.event_type == "undo_complete":
@@ -968,7 +986,21 @@ async def main(enable_hf_infra: bool | None = None, backend: str | None = None):
     except Exception:
         pass
 
-    print_banner(hf_user=hf_user)
+    # Load config before the banner so it can show backend + hf_infra.
+    config_path = Path(__file__).parent.parent / "configs" / "main_agent_config.json"
+    config = load_config(config_path)
+
+    if enable_hf_infra is not None:
+        config.enable_hf_infra = enable_hf_infra
+    if backend is not None:
+        config.backend = backend
+
+    print_banner(
+        model=config.model_name,
+        hf_user=hf_user,
+        backend=config.backend,
+        hf_infra=config.enable_hf_infra,
+    )
 
     # Pre-warm the HF router catalog in the background so /model switches
     # don't block on a network fetch.
@@ -984,14 +1016,7 @@ async def main(enable_hf_infra: bool | None = None, backend: str | None = None):
     turn_complete_event.set()
     ready_event = asyncio.Event()
 
-    # Start agent loop in background
-    config_path = Path(__file__).parent.parent / "configs" / "main_agent_config.json"
-    config = load_config(config_path)
-
-    if enable_hf_infra is not None:
-        config.enable_hf_infra = enable_hf_infra
-    if backend is not None:
-        config.backend = backend
+    # Start agent loop in background (config already loaded above).
 
     # Create tool router with local mode
     tool_router = ToolRouter(
@@ -1266,6 +1291,9 @@ async def headless_main(
     stream_buf = _StreamBuffer(console)
     _hl_last_tool = [None]
     _hl_sub_id = [1]
+    # See event_listener() above for the rationale — skip the full
+    # `assistant_message` render when chunks already covered the same text.
+    _hl_streamed = [False]
     # Research sub-agent tool calls are buffered per agent_id and dumped as
     # a static block once each sub-agent finishes, instead of streaming via
     # the live redrawing SubAgentDisplayManager (which is TTY-only).
@@ -1277,16 +1305,21 @@ async def headless_main(
         if event.event_type == "assistant_chunk":
             content = event.data.get("content", "") if event.data else ""
             if content:
+                _hl_streamed[0] = True
                 stream_buf.add_chunk(content)
                 await stream_buf.flush_ready(instant=True)
         elif event.event_type == "assistant_stream_end":
             await stream_buf.finish(instant=True)
         elif event.event_type == "assistant_message":
+            if _hl_streamed[0]:
+                _hl_streamed[0] = False
+                continue
             content = event.data.get("content", "") if event.data else ""
             if content:
                 await print_markdown(content, instant=True)
         elif event.event_type == "tool_call":
             stream_buf.discard()
+            _hl_streamed[0] = False
             tool_name = event.data.get("tool", "") if event.data else ""
             arguments = event.data.get("arguments", {}) if event.data else {}
             if tool_name:

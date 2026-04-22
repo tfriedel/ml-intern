@@ -87,7 +87,12 @@ def get_console() -> Console:
 
 # ── Banner ─────────────────────────────────────────────────────────────
 
-def print_banner(model: str | None = None, hf_user: str | None = None) -> None:
+def print_banner(
+    model: str | None = None,
+    hf_user: str | None = None,
+    backend: str | None = None,
+    hf_infra: bool | None = None,
+) -> None:
     """Print particle logo then CRT boot sequence with system info."""
     from agent.utils.particle_logo import run_particle_logo
     from agent.utils.crt_boot import run_boot_sequence
@@ -101,15 +106,22 @@ def print_banner(model: str | None = None, hf_user: str | None = None) -> None:
 
     model_label = model or "anthropic/claude-opus-4-6"
     user_label = hf_user or "not logged in"
+    backend_label = backend or "litellm"
+    hf_infra_label = "on" if hf_infra else "off" if hf_infra is False else "on"
 
     # Warm gold palette matching the shimmer highlight (255, 200, 80)
     gold = "rgb(255,200,80)"
     dim_gold = "rgb(180,140,40)"
 
+    # NB: print_init_done counts cursor-up from the bottom to overwrite
+    # the "Tools: loading..." line. Adding lines ABOVE "Tools: loading"
+    # is safe; inserting lines between "Tools" and "/help" would break it.
     boot_lines = [
         (f"{_I}Initializing agent runtime...", gold),
         (f"{_I}  User: {user_label}", dim_gold),
         (f"{_I}  Model: {model_label}", dim_gold),
+        (f"{_I}  Backend: {backend_label}", dim_gold),
+        (f"{_I}  HF infra: {hf_infra_label}", dim_gold),
         (f"{_I}  Tools: loading...", dim_gold),
         ("", ""),
         (f"{_I}/help for commands · /model to switch · /quit to exit", gold),
