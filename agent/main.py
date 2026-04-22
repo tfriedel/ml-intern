@@ -914,7 +914,7 @@ def _handle_slash_command(
     return None
 
 
-async def main(enable_hf_infra: bool | None = None):
+async def main(enable_hf_infra: bool | None = None, backend: str | None = None):
     """Interactive chat with the agent"""
 
     # Clear screen
@@ -958,6 +958,8 @@ async def main(enable_hf_infra: bool | None = None):
 
     if enable_hf_infra is not None:
         config.enable_hf_infra = enable_hf_infra
+    if backend is not None:
+        config.backend = backend
 
     # Create tool router with local mode
     tool_router = ToolRouter(
@@ -980,6 +982,7 @@ async def main(enable_hf_infra: bool | None = None):
             hf_token=hf_token,
             local_mode=True,
             stream=True,
+            backend=config.backend,
         )
     )
 
@@ -1148,6 +1151,7 @@ async def headless_main(
     max_iterations: int | None = None,
     stream: bool = True,
     enable_hf_infra: bool | None = None,
+    backend: str | None = None,
 ) -> None:
     """Run a single prompt headlessly and exit."""
     import logging
@@ -1173,9 +1177,12 @@ async def headless_main(
 
     if enable_hf_infra is not None:
         config.enable_hf_infra = enable_hf_infra
+    if backend is not None:
+        config.backend = backend
 
     print(f"Model: {config.model_name}", file=sys.stderr)
     print(f"Max iterations: {config.max_iterations}", file=sys.stderr)
+    print(f"Backend: {config.backend}", file=sys.stderr)
     print(f"HF infra tools: {'on' if config.enable_hf_infra else 'off'}", file=sys.stderr)
     print(f"Prompt: {prompt}", file=sys.stderr)
     print("---", file=sys.stderr)
@@ -1201,6 +1208,7 @@ async def headless_main(
             hf_token=hf_token,
             local_mode=True,
             stream=stream,
+            backend=config.backend,
         )
     )
 
@@ -1379,7 +1387,23 @@ def cli():
             "Overrides the config default."
         ),
     )
+    parser.add_argument(
+        "--backend",
+        choices=("litellm", "sdk"),
+        default=None,
+        help=(
+            "LLM backend. 'litellm' (default) uses ANTHROPIC_API_KEY. "
+            "'sdk' uses the Claude Agent SDK (`claude login` auth, no API key "
+            "required); defaults to --no-hf-infra unless you also pass "
+            "--enable-hf-infra."
+        ),
+    )
     args = parser.parse_args()
+
+    # SDK backend is local-first by default: if the user didn't explicitly
+    # set --enable-hf-infra / --no-hf-infra, pick --no-hf-infra for them.
+    if args.backend == "sdk" and args.enable_hf_infra is None:
+        args.enable_hf_infra = False
 
     try:
         if args.prompt:
@@ -1393,10 +1417,16 @@ def cli():
                     max_iterations=max_iter,
                     stream=not args.no_stream,
                     enable_hf_infra=args.enable_hf_infra,
+                    backend=args.backend,
                 )
             )
         else:
-            asyncio.run(main(enable_hf_infra=args.enable_hf_infra))
+            asyncio.run(
+                main(
+                    enable_hf_infra=args.enable_hf_infra,
+                    backend=args.backend,
+                )
+            )
     except KeyboardInterrupt:
         print("\n\nGoodbye!")
 

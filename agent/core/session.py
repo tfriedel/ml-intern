@@ -118,6 +118,10 @@ class Session:
         self.pending_approval: Optional[dict[str, Any]] = None
         self.sandbox = None
         self._running_job_ids: set[str] = set()  # HF job IDs currently executing
+        # Set by submission_loop when backend=='sdk'. When present,
+        # Handlers.run_agent delegates the LLM+tool loop to it instead of
+        # calling litellm.
+        self.sdk_backend: Optional[Any] = None
 
         # Session trajectory logging
         self.logged_events: list[dict] = []

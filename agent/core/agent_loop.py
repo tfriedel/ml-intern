@@ -458,6 +458,24 @@ class Handlers:
             Event(event_type="processing", data={"message": "Processing user input"})
         )
 
+        # SDK backend path: delegate the LLM + tool loop to Claude Agent SDK.
+        # The SDK drives its own tool loop, approval callback, and streaming;
+        # the adapter pushes `tool_call`/`tool_output`/`turn_complete`/etc.
+        # onto the same event_queue the litellm path uses.
+        if session.sdk_backend is not None:
+            try:
+                await session.sdk_backend.run_turn(text)
+            except asyncio.CancelledError:
+                await session.send_event(Event(event_type="interrupted"))
+                raise
+            except Exception as e:
+                await session.send_event(
+                    Event(event_type="error", data={"error": _friendly_error_message(e) or str(e)})
+                )
+            session.increment_turn()
+            await session.auto_save_if_needed()
+            return None
+
         # Agentic loop - continue until model doesn't call tools or max iterations is reached
         iteration = 0
         final_response = None
@@ -1134,6 +1152,7 @@ async def submission_loop(
     hf_token: str | None = None,
     local_mode: bool = False,
     stream: bool = True,
+    backend: str = "litellm",
 ) -> None:
     """
     Main agent loop - processes submissions and dispatches to handlers.
@@ -1166,21 +1185,43 @@ async def submission_loop(
                 })
             )
 
-            while session.is_running:
-                submission = await submission_queue.get()
+            # Optional SDK backend: owns a persistent ClaudeSDKClient that
+            # drives the LLM + tool loop for every subsequent turn. Stays
+            # alive for the lifetime of this submission_loop.
+            sdk_backend = None
+            if backend == "sdk":
+                from agent.core.sdk_backend import SDKBackend
+                sdk_backend = SDKBackend(
+                    tool_specs=list(tool_router.tools.values()),
+                    event_queue=event_queue,
+                    config=config,
+                    session=session,
+                    system_prompt=session.context_manager.system_prompt,
+                    max_turns=session.config.max_iterations if session.config.max_iterations > 0 else 500,
+                )
+                await sdk_backend.connect()
+                session.sdk_backend = sdk_backend
 
-                try:
-                    should_continue = await process_submission(session, submission)
-                    if not should_continue:
+            try:
+                while session.is_running:
+                    submission = await submission_queue.get()
+
+                    try:
+                        should_continue = await process_submission(session, submission)
+                        if not should_continue:
+                            break
+                    except asyncio.CancelledError:
+                        logger.warning("Agent loop cancelled")
                         break
-                except asyncio.CancelledError:
-                    logger.warning("Agent loop cancelled")
-                    break
-                except Exception as e:
-                    logger.error(f"Error in agent loop: {e}")
-                    await session.send_event(
-                        Event(event_type="error", data={"error": str(e)})
-                    )
+                    except Exception as e:
+                        logger.error(f"Error in agent loop: {e}")
+                        await session.send_event(
+                            Event(event_type="error", data={"error": str(e)})
+                        )
+            finally:
+                if sdk_backend is not None:
+                    await sdk_backend.close()
+                    session.sdk_backend = None
 
         logger.info("Agent loop exited")
 

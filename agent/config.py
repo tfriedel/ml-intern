@@ -40,6 +40,12 @@ class Config(BaseModel):
     # explicitly passes `--enable-hf-infra`.
     enable_hf_infra: bool = True
 
+    # Which backend drives the LLM. "litellm" (default) keeps the existing
+    # acompletion + ANTHROPIC_API_KEY path; "sdk" routes through
+    # `agent.core.sdk_backend.SDKBackend` (Claude Agent SDK, `claude login`,
+    # no API key required, local-first).
+    backend: str = "litellm"
+
     # Reasoning effort for models that support it (GPT-5 / o-series, Claude
     # extended thinking, HF reasoning models like MiniMax M2 / Kimi K2).
     # Defaults to "high" — we'd rather spend tokens thinking than ship a
