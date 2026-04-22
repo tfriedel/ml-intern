@@ -135,12 +135,15 @@ class ToolRouter:
         hf_token: str | None = None,
         local_mode: bool = False,
         enable_hf_infra: bool = True,
+        use_sdk_builtins: bool = False,
     ):
         self.tools: dict[str, ToolSpec] = {}
         self.mcp_servers: dict[str, dict[str, Any]] = {}
 
         for tool in create_builtin_tools(
-            local_mode=local_mode, enable_hf_infra=enable_hf_infra
+            local_mode=local_mode,
+            enable_hf_infra=enable_hf_infra,
+            use_sdk_builtins=use_sdk_builtins,
         ):
             self.register_tool(tool)
 
@@ -298,7 +301,9 @@ HF_INFRA_TOOL_NAMES: set[str] = {
 
 
 def create_builtin_tools(
-    local_mode: bool = False, enable_hf_infra: bool = True
+    local_mode: bool = False,
+    enable_hf_infra: bool = True,
+    use_sdk_builtins: bool = False,
 ) -> list[ToolSpec]:
     """Create built-in tool specifications.
 
@@ -308,6 +313,9 @@ def create_builtin_tools(
         enable_hf_infra: when False, drop tools that submit HF Jobs, create
             sandboxes, or write to the Hub. Read-only HF tools
             (hf_inspect_dataset, hf_papers, explore_hf_docs, …) are kept.
+        use_sdk_builtins: when True, skip registering the MCP local bash /
+            read / write / edit wrappers — Claude Code's builtin tools
+            will handle those on the SDK backend path.
     """
     # in order of importance
     tools = [
@@ -397,13 +405,14 @@ def create_builtin_tools(
         tools = [t for t in tools if t.name not in HF_INFRA_TOOL_NAMES]
 
     # Sandbox or local tools (highest priority)
-    if local_mode:
+    if local_mode and not use_sdk_builtins:
         from agent.tools.local_tools import get_local_tools
         tools = get_local_tools() + tools
-    elif enable_hf_infra:
+    elif not local_mode and enable_hf_infra:
         tools = get_sandbox_tools() + tools
-    # else: no local_mode and no HF infra → caller supplies bash/file tools
-    # itself (e.g. SDK backend relying on Claude Code builtins).
+    # else: SDK backend is relying on Claude Code's builtin Bash/Read/Write/Edit
+    # (use_sdk_builtins=True) or the caller wants a tools-only surface with no
+    # local/remote shell.
 
     tool_names = ", ".join([t.name for t in tools])
     logger.info(f"Loaded {len(tools)} built-in tools: {tool_names}")

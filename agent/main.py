@@ -967,6 +967,7 @@ async def main(enable_hf_infra: bool | None = None, backend: str | None = None):
         hf_token=hf_token,
         local_mode=True,
         enable_hf_infra=config.enable_hf_infra,
+        use_sdk_builtins=(config.backend == "sdk"),
     )
 
     # Session holder for interrupt/model/status access
@@ -1195,6 +1196,7 @@ async def headless_main(
         hf_token=hf_token,
         local_mode=True,
         enable_hf_infra=config.enable_hf_infra,
+        use_sdk_builtins=(config.backend == "sdk"),
     )
     session_holder: list = [None]
 

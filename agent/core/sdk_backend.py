@@ -48,12 +48,16 @@ from agent.core.session import Event
 logger = logging.getLogger(__name__)
 
 
-# Claude Code's built-in tools are disabled so ml-intern's tool-name-based
-# approval and prompts remain authoritative. Bash/Read/Write/Edit have
-# higher-quality builtin implementations (Spike 1 finding) but switching
-# to them changes which tools the approval callback sees. Revisit once
-# we decide whether to delete `agent/tools/local_tools.py`.
-DEFAULT_DISALLOWED_BUILTINS: list[str] = ["Bash", "Read", "Write", "Edit"]
+# Claude Code's built-in Bash/Read/Write/Edit are now allowed on the SDK
+# path. They have better implementations than our MCP wrappers (Spike 1
+# finding) and fix the orphan-process bug in `_bash_handler` that Spike 6
+# flagged (synchronous subprocess.run can't be cancelled). The model
+# prefers the builtins over MCP wrappers, so the MCP local_tools become
+# unused on this path — we also skip registering them in `create_builtin_tools`
+# when `use_sdk_builtins=True`. `_needs_approval()` doesn't match the
+# builtin names, so they execute without the extra approval gate
+# (acceptable for local file/shell use on the user's own machine).
+DEFAULT_DISALLOWED_BUILTINS: list[str] = []
 
 
 # ── Tool factory: ToolSpec → SdkMcpTool ────────────────────────────────
