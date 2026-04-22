@@ -62,6 +62,22 @@ SUGGESTED_MODELS = [
 ]
 
 
+def _check_sdk_prerequisites() -> None:
+    """Fail fast with a readable message when --backend sdk is requested
+    but the Claude Code CLI is missing. Login status is not pre-checked
+    here because an unauthenticated claude CLI raises its own clear error
+    at ClaudeSDKClient.connect() time."""
+    import shutil
+    if shutil.which("claude") is None:
+        print(
+            "ERROR: --backend sdk requires the Claude Code CLI on PATH.\n"
+            "Install: https://claude.com/claude-code\n"
+            "Then authenticate with: claude login\n",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 def _is_valid_model_id(model_id: str) -> bool:
     """Loose format check — lets users pick any model id.
 
@@ -1422,6 +1438,11 @@ def cli():
     # set --enable-hf-infra / --no-hf-infra, pick --no-hf-infra for them.
     if args.backend == "sdk" and args.enable_hf_infra is None:
         args.enable_hf_infra = False
+
+    # Fail fast if claude CLI is missing before we start an asyncio loop
+    # and wait for HF token prompts.
+    if args.backend == "sdk":
+        _check_sdk_prerequisites()
 
     try:
         if args.prompt:

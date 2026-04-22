@@ -26,11 +26,46 @@ ml-intern
 Create a `.env` file in the project root (or export these in your shell):
 
 ```bash
-ANTHROPIC_API_KEY=<your-anthropic-api-key> # if using anthropic models
+# Required for the default (litellm) backend:
+ANTHROPIC_API_KEY=<your-anthropic-api-key>
+# Not required when you use `--backend sdk` (Claude login auth).
+
 HF_TOKEN=<your-hugging-face-token>
-GITHUB_TOKEN=<github-personal-access-token> 
+GITHUB_TOKEN=<github-personal-access-token>
 ```
 If no `HF_TOKEN` is set, the CLI will prompt you to paste one on first launch. To get a GITHUB_TOKEN follow the tutorial [here](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens#creating-a-fine-grained-personal-access-token).
+
+### Backends
+
+ml-intern has two LLM backends:
+
+- **`litellm`** (default) — calls Claude via the Anthropic API; needs
+  `ANTHROPIC_API_KEY` and charges per token. Full tool set including
+  HF Jobs, HF Sandbox, and HF repo writes.
+- **`sdk`** — drives Claude via the [Claude Agent SDK](https://docs.claude.com/en/api/agent-sdk/overview)
+  using your `claude login` session (Pro / Max subscription, no API key
+  required). Local-first: defaults to no HF Jobs / no HF Sandbox / no
+  Hub writes, using Claude Code's built-in `Bash` / `Read` / `Write` /
+  `Edit` tools on your own machine.
+
+Opt into the SDK backend:
+
+```bash
+# Requires Claude Code CLI installed and `claude login` completed.
+ml-intern --backend sdk "fine-tune smollm on /tmp/my-data"
+```
+
+If you want the SDK backend with HF infrastructure still enabled:
+
+```bash
+ml-intern --backend sdk --enable-hf-infra "…"
+```
+
+Conversely, you can force the litellm backend to be local-first:
+
+```bash
+ml-intern --no-hf-infra "run a 10-step experiment locally"
+```
 
 ### Usage
 
@@ -49,9 +84,11 @@ ml-intern "fine-tune llama on my dataset"
 **Options:**
 
 ```bash
+ml-intern --backend {litellm,sdk}   "your prompt"
+ml-intern --enable-hf-infra         "your prompt"   # or --no-hf-infra
 ml-intern --model anthropic/claude-opus-4-6 "your prompt"
-ml-intern --max-iterations 100 "your prompt"
-ml-intern --no-stream "your prompt"
+ml-intern --max-iterations 100      "your prompt"
+ml-intern --no-stream               "your prompt"
 ```
 
 ## Architecture
