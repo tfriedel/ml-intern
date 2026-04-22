@@ -145,6 +145,17 @@ class Session:
     def cancel(self) -> None:
         """Signal cancellation to the running agent loop."""
         self._cancelled.set()
+        # SDK backend: also abort the in-flight turn at the ClaudeSDKClient
+        # level. `interrupt()` is idempotent and ~1ms (Spike 6), so firing it
+        # from a SIGINT handler is safe. If a loop is running, schedule the
+        # async call; otherwise silently skip (shutdown path).
+        backend = self.sdk_backend
+        if backend is not None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return
+            loop.create_task(backend.interrupt())
 
     def reset_cancel(self) -> None:
         """Clear the cancellation flag before a new run."""

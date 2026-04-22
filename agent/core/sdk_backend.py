@@ -336,8 +336,13 @@ class SDKBackend:
 
     async def interrupt(self) -> None:
         """Abort the current in-flight turn (if any)."""
-        if self._client is not None:
-            await self._client.interrupt()
+        if self._client is None:
+            return
+        # Let the adapter know an `is_error=True` ResultMessage is
+        # coming because of a user-initiated interrupt, not a real
+        # failure — so it can remap to `interrupted`.
+        self.adapter.mark_interrupted()
+        await self._client.interrupt()
 
     async def get_context_usage(self) -> dict[str, Any]:
         """Current context-window usage breakdown. Returns `{}` if

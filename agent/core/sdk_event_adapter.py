@@ -63,6 +63,17 @@ class SDKEventAdapter:
         # assistant_message events.
         self._seen_assistant_uuids: set[str] = set()
         self._seen_user_uuids: set[str] = set()
+        # Set by SDKBackend.interrupt() before the user-initiated abort
+        # reaches the stream. Lets `_handle_result` remap the resulting
+        # is_error ResultMessage to `interrupted` instead of `error`
+        # (Spike 6 finding: post-interrupt stop_reason=None, is_error=True).
+        self._interrupt_pending = False
+
+    def mark_interrupted(self) -> None:
+        """Signal the adapter that a user-initiated interrupt just fired.
+        The next `is_error=True` ResultMessage will surface as an
+        `interrupted` event instead of `error`."""
+        self._interrupt_pending = True
 
     async def _emit(self, event_type: str, data: dict[str, Any] | None = None) -> None:
         await self.q.put(Event(event_type=event_type, data=data))
@@ -236,7 +247,14 @@ class SDKEventAdapter:
         }
 
         if msg.is_error:
-            await self._emit("error", {"error": msg.result or "agent error"})
+            if self._interrupt_pending:
+                # User-initiated interrupt: surface ml-intern's `interrupted`
+                # event instead of a generic error. Clear the flag so the
+                # next unrelated error still reports as `error`.
+                self._interrupt_pending = False
+                await self._emit("interrupted", None)
+            else:
+                await self._emit("error", {"error": msg.result or "agent error"})
         else:
             # ml-intern emits `history_size`; we don't track that here —
             # substitute turn count so the frontend has something numeric.
