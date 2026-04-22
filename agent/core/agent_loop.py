@@ -23,6 +23,33 @@ logger = logging.getLogger(__name__)
 ToolCall = ChatCompletionMessageToolCall
 
 
+# Prepended to the system prompt when the SDK backend is running with
+# `enable_hf_infra=False`. Distils the guidance from `agent/skills/
+# finetune-locally.md` into a few imperative rules so the model
+# defaults to local bash + local data instead of HF Jobs.
+_LOCAL_FIRST_PRELUDE = (
+    "You are running in LOCAL-FIRST mode.\n"
+    "\n"
+    "Operating rules:\n"
+    "  - Use the built-in `Bash`, `Read`, `Write`, and `Edit` tools.\n"
+    "    These run on the user's own machine.\n"
+    "  - HF Jobs, HF Sandboxes, and HF repo write/push tools are NOT\n"
+    "    available. Never attempt to submit remote jobs. Run all training,\n"
+    "    evaluation, and data processing with local `Bash`.\n"
+    "  - Load datasets from local filesystem paths (e.g.\n"
+    "    `datasets.load_dataset('json', data_files='/path/to/train.jsonl')`).\n"
+    "  - Never set `push_to_hub=True` or upload a trained model to the\n"
+    "    Hub unless the user explicitly asks for it in this turn.\n"
+    "  - For exploratory fine-tunes prefer LoRA / PEFT over full\n"
+    "    fine-tuning to keep disk usage reasonable.\n"
+    "  - If the user asks for remote infrastructure, tell them to re-run\n"
+    "    with `--enable-hf-infra`. Do not silently fall back.\n"
+    "\n"
+    "See `agent/skills/finetune-locally.md` in the repo for a reference\n"
+    "LoRA + local-JSONL recipe.\n"
+)
+
+
 def _validate_tool_args(tool_args: dict) -> tuple[bool, str | None]:
     """
     Validate tool arguments structure.
@@ -1209,12 +1236,17 @@ async def submission_loop(
             sdk_backend = None
             if backend == "sdk":
                 from agent.core.sdk_backend import SDKBackend
+
+                system_prompt = session.context_manager.system_prompt
+                if config and not config.enable_hf_infra:
+                    system_prompt = _LOCAL_FIRST_PRELUDE + "\n\n" + system_prompt
+
                 sdk_backend = SDKBackend(
                     tool_specs=list(tool_router.tools.values()),
                     event_queue=event_queue,
                     config=config,
                     session=session,
-                    system_prompt=session.context_manager.system_prompt,
+                    system_prompt=system_prompt,
                     max_turns=session.config.max_iterations if session.config.max_iterations > 0 else 500,
                 )
                 await sdk_backend.connect()

@@ -60,6 +60,7 @@ session_logs/
 /logs
 hf-agent-leaderboard/
 skills/
+!agent/skills/
 .claude/
 *.jsonl
 *.csv
