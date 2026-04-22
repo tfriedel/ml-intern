@@ -1248,6 +1248,7 @@ async def submission_loop(
                     session=session,
                     system_prompt=system_prompt,
                     max_turns=session.config.max_iterations if session.config.max_iterations > 0 else 500,
+                    tool_router=tool_router,
                 )
                 await sdk_backend.connect()
                 session.sdk_backend = sdk_backend

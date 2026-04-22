@@ -90,6 +90,7 @@ def _accepts_kwargs(sig: inspect.Signature) -> bool:
 def make_sdk_tool_from_spec(
     spec: Any,  # ToolSpec (avoid circular import on Session-building order)
     session_provider: Callable[[], Any | None],
+    tool_router_call: Callable[..., Awaitable[tuple[str, bool]]] | None = None,
 ) -> SdkMcpTool:
     """Wrap one ml-intern ToolSpec as an in-process SDK MCP tool.
 
@@ -98,6 +99,12 @@ def make_sdk_tool_from_spec(
     still get at the live session object — and we forward `tool_call_id`
     when available via a contextvar-style stash populated by
     `can_use_tool` (see `SDKBackend._set_current_tool_call_id`).
+
+    Specs loaded from external MCP servers (e.g. huggingface.co/mcp)
+    arrive with `handler=None`; the litellm path routes those through
+    `ToolRouter.call_tool` which falls through to `mcp_client.call_tool`.
+    On the SDK path we do the same by threading a `tool_router_call`
+    callable and dispatching through it when `spec.handler` is absent.
     """
     handler = spec.handler
 
@@ -114,7 +121,19 @@ def make_sdk_tool_from_spec(
         session = session_provider()
         tool_call_id = _current_tool_call_id.get(None) if session else None
         try:
-            output, ok = await _call_handler(handler, clean, session, tool_call_id)
+            if handler is None:
+                if tool_router_call is None:
+                    raise RuntimeError(
+                        f"Tool '{spec.name}' has no handler and no tool_router"
+                        " was provided to SDKBackend to route external MCP calls."
+                    )
+                output, ok = await tool_router_call(
+                    spec.name, clean, session=session, tool_call_id=tool_call_id
+                )
+            else:
+                output, ok = await _call_handler(
+                    handler, clean, session, tool_call_id
+                )
         except Exception as e:  # noqa: BLE001 — convert to tool error
             logger.exception("Handler %s raised", spec.name)
             return {
@@ -255,6 +274,7 @@ class SDKBackend:
             Callable[[str, dict[str, Any], str | None], Awaitable[bool]] | None
         ) = None,
         env: dict[str, str] | None = None,
+        tool_router: Any | None = None,
     ):
         self.event_queue = event_queue
         self.config = config
@@ -262,11 +282,20 @@ class SDKBackend:
         self.system_prompt = system_prompt
         self.max_turns = max_turns
         self.env = env or {}
+        self.tool_router = tool_router
         self.adapter = SDKEventAdapter(event_queue)
 
         # Build in-process MCP server from the ml-intern tool specs.
+        # Specs with handler=None (external MCP tools fetched by
+        # ToolRouter from huggingface.co/mcp et al.) dispatch through
+        # `tool_router.call_tool` so their external transport is used.
+        tr_call = tool_router.call_tool if tool_router is not None else None
         sdk_tools = [
-            make_sdk_tool_from_spec(spec, session_provider=lambda: self.session)
+            make_sdk_tool_from_spec(
+                spec,
+                session_provider=lambda: self.session,
+                tool_router_call=tr_call,
+            )
             for spec in tool_specs
         ]
         self._server = create_sdk_mcp_server(
