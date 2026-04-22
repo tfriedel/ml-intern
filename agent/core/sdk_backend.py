@@ -32,12 +32,12 @@ from typing import Any, Awaitable, Callable, Iterable
 
 from claude_agent_sdk import (
     ClaudeAgentOptions,
+    ClaudeSDKClient,
     PermissionResultAllow,
     PermissionResultDeny,
     SdkMcpTool,
     ToolPermissionContext,
     create_sdk_mcp_server,
-    query,
     tool,
 )
 
@@ -221,10 +221,21 @@ def make_permission_callback(
 class SDKBackend:
     """Drives the Claude Agent SDK against ml-intern's tools + events.
 
-    Swap-in replacement for the litellm LLM-call section of
-    `Handlers.run_agent`. Does NOT replace the submission loop, session
-    bookkeeping, context-manager persistence, or approval-batching —
-    those stay in `agent/core/agent_loop.py` for now.
+    Owns a long-lived `ClaudeSDKClient` so prompt cache, conversation
+    history, and MCP connections persist across turns. Use as an async
+    context manager:
+
+        async with SDKBackend(...) as backend:
+            await backend.run_turn("hello")
+            await backend.run_turn("continue")
+            usage = await backend.get_context_usage()
+
+    A single-shot `run_turn()` call without `async with` works too —
+    the backend lazy-connects and the caller must invoke `close()`.
+
+    Does NOT replace the submission loop, session bookkeeping,
+    context-manager persistence, or approval-batching — those stay in
+    `agent/core/agent_loop.py`.
     """
 
     def __init__(
@@ -239,12 +250,14 @@ class SDKBackend:
         await_user_decision: (
             Callable[[str, dict[str, Any], str | None], Awaitable[bool]] | None
         ) = None,
+        env: dict[str, str] | None = None,
     ):
         self.event_queue = event_queue
         self.config = config
         self.session = session
         self.system_prompt = system_prompt
         self.max_turns = max_turns
+        self.env = env or {}
         self.adapter = SDKEventAdapter(event_queue)
 
         # Build in-process MCP server from the ml-intern tool specs.
@@ -265,6 +278,8 @@ class SDKBackend:
             await_user_decision=await_user_decision,
         )
 
+        self._client: ClaudeSDKClient | None = None
+
     def _build_options(self) -> ClaudeAgentOptions:
         return ClaudeAgentOptions(
             system_prompt=self.system_prompt,
@@ -275,21 +290,65 @@ class SDKBackend:
             can_use_tool=self._permission_cb,
             include_partial_messages=True,
             max_turns=self.max_turns,
+            env=self.env,
         )
+
+    # ── Lifecycle ───────────────────────────────────────────────────
+
+    async def connect(self) -> None:
+        if self._client is not None:
+            return
+        self._client = ClaudeSDKClient(options=self._build_options())
+        await self._client.connect()
+
+    async def close(self) -> None:
+        if self._client is None:
+            return
+        try:
+            await self._client.disconnect()
+        finally:
+            self._client = None
+
+    async def __aenter__(self) -> "SDKBackend":
+        await self.connect()
+        return self
+
+    async def __aexit__(self, *_exc: Any) -> None:
+        await self.close()
+
+    # ── Turn execution ──────────────────────────────────────────────
 
     async def run_turn(self, user_message: str) -> dict[str, Any]:
-        """Run one user turn and stream events onto the queue."""
-        options = self._build_options()
+        """Send one user message and stream events onto the queue.
 
-        async def prompt_stream():
-            yield {
-                "type": "user",
-                "message": {"role": "user", "content": user_message},
-            }
+        Lazy-connects if the backend isn't inside `async with` yet.
+        """
+        await self.connect()
+        assert self._client is not None
+        await self._client.query(user_message)
+        return await self.adapter.consume(self._client.receive_response())
 
-        return await self.adapter.consume(
-            query(prompt=prompt_stream(), options=options)
-        )
+    # ── Delegated capabilities (from ClaudeSDKClient) ───────────────
+
+    async def interrupt(self) -> None:
+        """Abort the current in-flight turn (if any)."""
+        if self._client is not None:
+            await self._client.interrupt()
+
+    async def get_context_usage(self) -> dict[str, Any]:
+        """Current context-window usage breakdown. Returns `{}` if
+        the backend isn't connected yet."""
+        if self._client is None:
+            return {}
+        return await self._client.get_context_usage()
+
+    async def set_model(self, model: str) -> None:
+        if self._client is not None:
+            await self._client.set_model(model)
+
+    async def set_permission_mode(self, mode: str) -> None:
+        if self._client is not None:
+            await self._client.set_permission_mode(mode)
 
 
 # ── Smoke-test demo ────────────────────────────────────────────────────
@@ -336,7 +395,14 @@ def _build_demo_tool_specs():
 
 
 SCENARIOS: dict[str, tuple[str, bool]] = {
-    "bash": ("Use `bash` to print the current date.", False),
+    # Ask for something the model can only know via a tool (i.e. the
+    # running process id), so it doesn't answer from context and skip
+    # the bash call. `bash` refers to our MCP tool, not the builtin.
+    "bash": (
+        "Call the `bash` MCP tool with command `echo $$` and report the "
+        "exact shell PID it prints. Do not answer from memory.",
+        False,
+    ),
     "deny": (
         "Submit a GPU job with hf_jobs (operation=run, "
         "hardware_flavor=t4-small, script='print(1)', timeout='5m'). "
@@ -371,7 +437,7 @@ async def _run_demo(scenario: str) -> None:
     print(f"\n>>> prompt: {prompt}\n", flush=True)
 
     q: asyncio.Queue = asyncio.Queue()
-    backend = SDKBackend(
+    async with SDKBackend(
         tool_specs=_build_demo_tool_specs(),
         event_queue=q,
         config=None,
@@ -382,18 +448,26 @@ async def _run_demo(scenario: str) -> None:
         ),
         max_turns=6,
         deny_all_sensitive=deny,
-    )
+    ) as backend:
+        done = asyncio.Event()
+        drain_task = asyncio.create_task(_drain_and_print(q, done))
+        try:
+            summary = await backend.run_turn(prompt)
+        finally:
+            done.set()
+            await drain_task
 
-    done = asyncio.Event()
-    drain_task = asyncio.create_task(_drain_and_print(q, done))
-    try:
-        summary = await backend.run_turn(prompt)
-    finally:
-        done.set()
-        await drain_task
+        usage = await backend.get_context_usage()
 
     print("\n--- result summary ---", flush=True)
     print(json.dumps(summary, default=str, indent=2))
+    print("\n--- context usage ---", flush=True)
+    print(
+        f"  totalTokens={usage.get('totalTokens'):,}   "
+        f"percentage={usage.get('percentage'):.2f}%   "
+        f"autoCompact={usage.get('isAutoCompactEnabled')} "
+        f"@ {usage.get('autoCompactThreshold')}"
+    )
 
 
 def demo() -> None:

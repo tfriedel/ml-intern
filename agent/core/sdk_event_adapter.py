@@ -57,6 +57,12 @@ class SDKEventAdapter:
         # Buffer partial text between AssistantMessage boundaries so we
         # emit exactly one `assistant_message` per completed text block.
         self._streaming_open = False
+        # With `include_partial_messages=True` the SDK can emit the same
+        # AssistantMessage multiple times during streaming. Dedupe on
+        # message_id/uuid so we don't fire duplicate tool_call and
+        # assistant_message events.
+        self._seen_assistant_uuids: set[str] = set()
+        self._seen_user_uuids: set[str] = set()
 
     async def _emit(self, event_type: str, data: dict[str, Any] | None = None) -> None:
         await self.q.put(Event(event_type=event_type, data=data))
@@ -134,6 +140,15 @@ class SDKEventAdapter:
                     await self._emit("assistant_chunk", {"content": text})
 
     async def _handle_assistant(self, msg: AssistantMessage) -> None:
+        # Dedupe: with include_partial_messages the SDK can emit the
+        # same AssistantMessage multiple times. Fire events only on
+        # the first sighting (uuid is stable; message_id is a fallback).
+        key = msg.uuid or msg.message_id
+        if key:
+            if key in self._seen_assistant_uuids:
+                return
+            self._seen_assistant_uuids.add(key)
+
         # End any open streaming run before emitting fully-formed blocks.
         if self._streaming_open:
             await self._emit("assistant_stream_end", {})
@@ -175,6 +190,14 @@ class SDKEventAdapter:
             await self._emit("error", {"error": f"assistant error: {msg.error}"})
 
     async def _handle_user(self, msg: UserMessage) -> None:
+        # Dedupe same as AssistantMessage — tool_output can otherwise
+        # double-fire on partial-message streams.
+        uuid = getattr(msg, "uuid", None)
+        if uuid:
+            if uuid in self._seen_user_uuids:
+                return
+            self._seen_user_uuids.add(uuid)
+
         # The SDK echoes tool results as UserMessages with ToolResultBlocks.
         content = msg.content
         if isinstance(content, str):
