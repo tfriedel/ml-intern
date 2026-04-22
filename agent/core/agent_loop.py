@@ -1124,6 +1124,24 @@ async def process_submission(session: Session, submission) -> bool:
         return True
 
     if op.op_type == OpType.COMPACT:
+        # The SDK backend runs Claude Code's own auto-compaction (Spike 4);
+        # a manual /compact from the user would try to call litellm without
+        # an API key. Surface a friendly notice instead.
+        if session.sdk_backend is not None:
+            await session.send_event(
+                Event(
+                    event_type="tool_log",
+                    data={
+                        "tool": "system",
+                        "log": (
+                            "Manual /compact is a no-op on the SDK backend — "
+                            "Claude Code auto-compacts at ~967k tokens. "
+                            "See `/context` for current usage."
+                        ),
+                    },
+                )
+            )
+            return True
         await _compact_and_notify(session)
         return True
 
