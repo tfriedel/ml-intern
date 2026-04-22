@@ -417,6 +417,15 @@ async def event_listener(
             event = await event_queue.get()
 
             if event.event_type == "ready":
+                # The SDK path produces TWO `ready` events: one from
+                # submission_loop at startup, and a second one from the
+                # SDK adapter when the ClaudeSDKClient processes its init
+                # SystemMessage during the first turn. `print_init_done`
+                # uses cursor-up escapes to overwrite "Tools: loading..."
+                # — running it a second time mid-turn smears the banner
+                # into the middle of chat output. Render once only.
+                if ready_event.is_set():
+                    continue
                 tool_count = event.data.get("tool_count", 0) if event.data else 0
                 print_init_done(tool_count=tool_count)
                 ready_event.set()
