@@ -807,7 +807,7 @@ async def get_user_input(prompt_session: PromptSession) -> str:
 # Slash commands are defined in terminal_display
 
 
-def _handle_slash_command(
+async def _handle_slash_command(
     cmd: str,
     config,
     session_holder: list,
@@ -904,10 +904,26 @@ def _handle_slash_command(
     if command == "/status":
         session = session_holder[0] if session_holder else None
         print(f"Model: {config.model_name}")
+        print(f"Backend: {config.backend}")
         print(f"Reasoning effort: {config.reasoning_effort or 'off'}")
+        print(f"HF infra tools: {'on' if config.enable_hf_infra else 'off'}")
         if session:
             print(f"Turns: {session.turn_count}")
             print(f"Context items: {len(session.context_manager.items)}")
+            # SDK backend exposes a live token/context-window readout via
+            # ClaudeSDKClient.get_context_usage(). Only populated once a
+            # turn has run (ResultMessage needed to seed it).
+            if session.sdk_backend is not None:
+                try:
+                    usage = await session.sdk_backend.get_context_usage()
+                except Exception as e:
+                    usage = {"error": str(e)}
+                if usage and "totalTokens" in usage:
+                    pct = usage.get("percentage", 0)
+                    total = usage.get("totalTokens", 0)
+                    print(f"Context: {total:,} tokens ({pct:.1f}%)")
+                elif usage.get("error"):
+                    print(f"Context: unavailable ({usage['error']})")
         return None
 
     print(f"Unknown command: {command}. Type /help for available commands.")
@@ -1095,7 +1111,7 @@ async def main(enable_hf_infra: bool | None = None, backend: str | None = None):
 
             # Handle slash commands
             if user_input.strip().startswith("/"):
-                sub = _handle_slash_command(
+                sub = await _handle_slash_command(
                     user_input.strip(), config, session_holder, submission_queue, submission_id
                 )
                 if sub is None:
