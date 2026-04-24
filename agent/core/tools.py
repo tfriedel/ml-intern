@@ -292,12 +292,73 @@ class ToolRouter:
 
 # Tools that use HF remote infrastructure (compute or writes to the Hub).
 # Filtered out when `enable_hf_infra=False` (the local-first default for the
-# SDK backend).
+# SDK backend). `hf_repo_files` is NOT in this set: its read-only ops
+# (list/read) are load-bearing for research, so we replace it with a
+# restricted variant instead of dropping it — see `_readonly_hf_repo_files`.
 HF_INFRA_TOOL_NAMES: set[str] = {
     HF_JOBS_TOOL_SPEC["name"],
-    HF_REPO_FILES_TOOL_SPEC["name"],
     HF_REPO_GIT_TOOL_SPEC["name"],
 }
+
+
+_READONLY_HF_REPO_FILES_OPS: frozenset[str] = frozenset({"list", "read"})
+
+
+async def _readonly_hf_repo_files_handler(
+    arguments: dict[str, Any], session: Any = None
+) -> tuple[str, bool]:
+    """Wrap hf_repo_files_handler so only read ops (list/read) reach the
+    real handler. Belt-and-suspenders: the JSON-schema enum already
+    narrows the LLM's view, but an unvalidated payload shouldn't get to
+    upload/delete code paths either.
+    """
+    op = arguments.get("operation")
+    if op not in _READONLY_HF_REPO_FILES_OPS:
+        return (
+            f"Operation '{op}' is disabled in read-only mode. "
+            "Only 'list' and 'read' are available. Restart the MCP server with "
+            "ML_INTERN_MCP_HF_INFRA=1 (or the agent CLI with --enable-hf-infra) "
+            "to enable write operations.",
+            False,
+        )
+    return await hf_repo_files_handler(arguments, session=session)
+
+
+def _readonly_hf_repo_files() -> ToolSpec:
+    """Read-only variant of hf_repo_files: list + read, no upload/delete."""
+    full = HF_REPO_FILES_TOOL_SPEC
+    full_props: dict[str, Any] = full["parameters"]["properties"]
+    readonly_props = {
+        k: v for k, v in full_props.items()
+        if k not in {"content", "patterns", "create_pr", "commit_message"}
+    }
+    readonly_props["operation"] = {
+        **full_props["operation"],
+        "enum": ["list", "read"],
+        "description": "Operation: list or read (write ops disabled without --enable-hf-infra)",
+    }
+    return ToolSpec(
+        name=full["name"],
+        description=(
+            "Read files in HF repos (models/datasets/spaces).\n\n"
+            "## Operations\n"
+            "- **list**: List files with sizes and structure\n"
+            "- **read**: Read file content (text files only)\n\n"
+            "## Use when\n"
+            "- Need to see what files exist in a repo (before downloading)\n"
+            "- Want to read config.json, README.md, tokenizer_config.json, dataset cards, etc.\n\n"
+            "## Notes\n"
+            "- For binary files (safetensors, bin), `list` shows them but `read` won't work\n"
+            "- Upload/delete are disabled in read-only mode. To enable them, restart with"
+            " ML_INTERN_MCP_HF_INFRA=1 (Claude Code) or --enable-hf-infra (agent CLI).\n"
+        ),
+        parameters={
+            "type": "object",
+            "properties": readonly_props,
+            "required": full["parameters"]["required"],
+        },
+        handler=_readonly_hf_repo_files_handler,
+    )
 
 
 def create_builtin_tools(
@@ -401,8 +462,14 @@ def create_builtin_tools(
 
     # Drop HF remote-infra tools when disabled. Runs before the sandbox/local
     # choice so we also skip the sandbox branch (remote compute) below.
+    # `hf_repo_files` is a special case — keep a read-only variant so research
+    # can still peek at config.json / README.md / dataset cards.
     if not enable_hf_infra:
         tools = [t for t in tools if t.name not in HF_INFRA_TOOL_NAMES]
+        tools = [
+            _readonly_hf_repo_files() if t.name == HF_REPO_FILES_TOOL_SPEC["name"] else t
+            for t in tools
+        ]
 
     # The `research` tool spawns a subagent that calls `litellm.acompletion`
     # directly — it needs ANTHROPIC_API_KEY and bypasses SDKBackend. On the
