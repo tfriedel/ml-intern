@@ -67,6 +67,56 @@ Conversely, you can force the litellm backend to be local-first:
 ml-intern --no-hf-infra "run a 10-step experiment locally"
 ```
 
+### Using from Claude Code
+
+Instead of running the standalone `ml-intern` CLI, you can expose the
+tools, skill, and research sub-agent directly inside
+[Claude Code](https://docs.claude.com/en/docs/claude-code) sessions. The
+installer wires up four pieces in one shot:
+
+```bash
+# Read-only (default): list/read Hub repos, search docs/papers, no writes
+scripts/install-claude-code.sh
+
+# With write ops on HF (hf_jobs, upload, delete, repo git)
+scripts/install-claude-code.sh --enable-hf-infra
+
+# Remove everything the installer added
+scripts/install-claude-code.sh --uninstall
+```
+
+What it installs:
+
+1. **`ml-intern`** stdio MCP server — ml-intern's tools (`hf_papers`,
+   `explore_hf_docs`, `hf_inspect_dataset`, `github_*`, `hf_repo_files`
+   read-only, …) registered via `claude mcp add`. Claude Code spawns it
+   on demand through `uv --directory <repo> run ml-intern-mcp`.
+2. **`hf-mcp-server`** (public HF MCP) — registered as an HTTP MCP so
+   Hub search / repo details / space info are available natively. OAuth
+   login triggers on first tool use. Skipped if you already have an
+   entry under that name. Add `--skip-hf-mcp` to opt out.
+3. **Skills** → `~/.claude/skills/` — `hf-ml-engineering` (literature-
+   first ML workflow, pre-flight checks, error recovery) and
+   `finetune-locally` (local LoRA recipe, no Hub writes).
+4. **`ml-research` sub-agent** → `~/.claude/agents/` — read-only
+   research agent invoked via
+   `Task(subagent_type="ml-research", ...)`. Same literature-first prompt
+   as the standalone agent, same restricted tool set.
+
+`--enable-hf-infra` flips `ML_INTERN_MCP_HF_INFRA=1` for the MCP server:
+the tool count goes from 9 (read-only) to 12 (adds `hf_jobs`,
+`hf_repo_git`, and unlocks `upload`/`delete` on `hf_repo_files`).
+
+Differences vs. the standalone CLI:
+
+- Claude Code's built-in `Bash` / `Read` / `Write` / `Edit` / `Task`
+  replace ml-intern's local/sandbox wrappers and the `research` tool.
+- `HF_TOKEN` / `GITHUB_TOKEN` come from the shell environment at MCP
+  launch; no `.env` is read.
+- No session logging, no doom-loop detector, no auto-compaction at
+  170k — Claude Code handles session transcripts and compaction
+  natively.
+
 ### Usage
 
 **Interactive mode** (start a chat session):
