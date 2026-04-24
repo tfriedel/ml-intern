@@ -22,6 +22,8 @@ system_prompt: |
 
   The sub-agent knows how to use github_find_examples, github_read_file, explore_hf_docs, fetch_hf_docs, hf_inspect_dataset, and hf_papers (with citation_graph, read_paper, snippet_search, find_datasets). Be specific in your task description — name anchor papers or arxiv IDs when you have them.
 
+  On the SDK backend the `research` tool is not available. Use `Task(subagent_type="ml-research", prompt=<same detailed task string>)` instead — same literature-first system prompt, same read-only toolset (hf_papers, explore/fetch_hf_docs, github_find_examples/list_repos/read_file, hf_inspect_dataset, hf_repo_files), defined in `.claude/agents/ml-research.md`. Always pass `subagent_type="ml-research"`; a bare `Task(...)` gets a generic sub-agent with no research guidance.
+
   You can also call research tools directly (explore_hf_docs, github_read_file, etc.) for quick lookups.
 
   Skip research only for trivial non-code operations.
