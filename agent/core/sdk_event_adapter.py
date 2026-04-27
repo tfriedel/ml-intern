@@ -21,7 +21,10 @@ separately — it is NOT driven from the message stream.
 from __future__ import annotations
 
 import asyncio
-from typing import Any, AsyncIterator
+import logging
+from typing import Any, AsyncIterator, Callable
+
+logger = logging.getLogger(__name__)
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -81,12 +84,21 @@ class SDKEventAdapter:
     async def _emit(self, event_type: str, data: dict[str, Any] | None = None) -> None:
         await self.q.put(Event(event_type=event_type, data=data))
 
+    # Optional hook fired on every received SDK message — used by the stall
+    # watchdog (sdk_backend.py) to know the turn is still progressing.
+    on_message: Callable[[], None] | None = None
+
     async def consume(self, messages: AsyncIterator) -> dict[str, Any]:
         """Consume SDK messages until the stream ends. Returns the final
         result summary (from ResultMessage) for callers that want it."""
         final: dict[str, Any] = {}
 
         async for msg in messages:
+            if self.on_message is not None:
+                try:
+                    self.on_message()
+                except Exception:
+                    logger.exception("on_message hook raised; continuing")
             if isinstance(msg, SystemMessage):
                 await self._handle_system(msg)
             elif isinstance(msg, StreamEvent):

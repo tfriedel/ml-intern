@@ -27,7 +27,9 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import os
 import sys
+import time
 from typing import Any, Awaitable, Callable, Iterable
 
 from claude_agent_sdk import (
@@ -238,6 +240,134 @@ def make_permission_callback(
     return cb
 
 
+# ── Stall watchdog ────────────────────────────────────────────────────
+
+
+def _resolve_seconds(env_var: str, kwarg: float | None, default: float) -> float:
+    raw = os.environ.get(env_var)
+    if raw is not None:
+        try:
+            value = float(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            logger.warning("Invalid %s=%r — ignoring", env_var, raw)
+    return kwarg if (kwarg is not None and kwarg > 0) else default
+
+
+class _StallWatchdog:
+    """Detect prolonged silence from the SDK and force-interrupt the turn.
+
+    Runs as an async context manager around `adapter.consume()`. While
+    active it:
+
+    * stamps a timestamp every time the adapter receives an SDK message
+      (via the ``on_message`` hook);
+    * emits a ``tool_log`` heartbeat every ``heartbeat_s`` so the operator
+      sees the turn is still being awaited (separate from any tool output);
+    * if no message arrives for ``stall_threshold_s``, fires a single
+      ``interrupt_cb`` to unblock the turn — `consume()` then returns
+      cleanly via the resulting `interrupted` ResultMessage.
+
+    The watchdog only fires *once* per turn. After a stall-triggered
+    interrupt the SDK delivers an `is_error=True` ResultMessage which
+    the adapter remaps to ``interrupted`` (because we set
+    ``mark_interrupted``); the turn ends and the agent loop drains any
+    queued user input.
+    """
+
+    def __init__(
+        self,
+        adapter: "SDKEventAdapter",
+        event_queue: asyncio.Queue,
+        interrupt_cb: Callable[[], Awaitable[None]],
+        stall_threshold_s: float,
+        heartbeat_s: float,
+    ):
+        self._adapter = adapter
+        self._event_queue = event_queue
+        self._interrupt_cb = interrupt_cb
+        self._stall_threshold_s = stall_threshold_s
+        self._heartbeat_s = heartbeat_s
+        self._last_activity = time.monotonic()
+        self._turn_start = self._last_activity
+        self._task: asyncio.Task | None = None
+        self._fired = False
+
+    def _bump(self) -> None:
+        self._last_activity = time.monotonic()
+
+    async def __aenter__(self) -> "_StallWatchdog":
+        self._last_activity = self._turn_start = time.monotonic()
+        self._adapter.on_message = self._bump
+        self._task = asyncio.create_task(self._run())
+        return self
+
+    async def __aexit__(self, *_exc: Any) -> None:
+        if self._adapter.on_message is self._bump:
+            self._adapter.on_message = None
+        if self._task is not None and not self._task.done():
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+
+    async def _run(self) -> None:
+        # Poll fast enough to surface heartbeats on time; the heartbeat
+        # interval is the cadence; the stall threshold is the bound.
+        poll = max(1.0, min(self._heartbeat_s, self._stall_threshold_s) / 4)
+        last_heartbeat = self._turn_start
+        try:
+            while True:
+                await asyncio.sleep(poll)
+                now = time.monotonic()
+                idle = now - self._last_activity
+
+                if (
+                    self._heartbeat_s > 0
+                    and now - last_heartbeat >= self._heartbeat_s
+                ):
+                    last_heartbeat = now
+                    elapsed = now - self._turn_start
+                    await self._event_queue.put(
+                        Event(
+                            event_type="tool_log",
+                            data={
+                                "tool": "system",
+                                "log": (
+                                    f"turn alive: {elapsed:.0f}s elapsed, "
+                                    f"{idle:.0f}s since last SDK message"
+                                ),
+                            },
+                        )
+                    )
+
+                if not self._fired and idle >= self._stall_threshold_s:
+                    self._fired = True
+                    await self._event_queue.put(
+                        Event(
+                            event_type="tool_log",
+                            data={
+                                "tool": "system",
+                                "log": (
+                                    f"No SDK activity for {idle:.0f}s "
+                                    f"(threshold {self._stall_threshold_s:.0f}s) — "
+                                    "sending interrupt to unstick the turn."
+                                ),
+                            },
+                        )
+                    )
+                    try:
+                        await self._interrupt_cb()
+                    except Exception as e:
+                        logger.error("Stall-interrupt failed: %s", e)
+                    # Keep running so heartbeats continue while the
+                    # interrupt is being honoured.
+        except asyncio.CancelledError:
+            return
+
+
 # ── Top-level façade ──────────────────────────────────────────────────
 
 
@@ -277,6 +407,8 @@ class SDKBackend:
         tool_router: Any | None = None,
         resume_session_id: str | None = None,
         fork_on_resume: bool = False,
+        stall_threshold_s: float | None = None,
+        heartbeat_s: float | None = None,
     ):
         self.event_queue = event_queue
         self.config = config
@@ -292,6 +424,17 @@ class SDKBackend:
         # rooted on the resumed history (preserves the original JSONL).
         self._resume_session_id = resume_session_id
         self._fork_on_resume = fork_on_resume
+        # Watchdog tunables. Env overrides win; explicit kwargs come second;
+        # defaults are last. Heartbeat at 60s gives the user a "still alive"
+        # ping without flooding the event queue. Stall at 15min is long
+        # enough not to fire on legitimately slow tools but short enough to
+        # recover within a coffee break.
+        self.stall_threshold_s = _resolve_seconds(
+            "ML_INTERN_STALL_THRESHOLD_S", stall_threshold_s, 15 * 60.0
+        )
+        self.heartbeat_s = _resolve_seconds(
+            "ML_INTERN_HEARTBEAT_S", heartbeat_s, 60.0
+        )
 
         # Build in-process MCP server from the ml-intern tool specs.
         # Specs with handler=None (external MCP tools fetched by
@@ -373,12 +516,23 @@ class SDKBackend:
     async def run_turn(self, user_message: str) -> dict[str, Any]:
         """Send one user message and stream events onto the queue.
 
-        Lazy-connects if the backend isn't inside `async with` yet.
+        Lazy-connects if the backend isn't inside `async with` yet. Runs a
+        stall watchdog alongside `consume()` — if no SDK messages arrive
+        for ``stall_threshold_s`` (default 15 min) we fire `interrupt()`
+        so the turn unblocks and queued user input can drain.
         """
         await self.connect()
         assert self._client is not None
         await self._client.query(user_message)
-        return await self.adapter.consume(self._client.receive_response())
+
+        async with _StallWatchdog(
+            adapter=self.adapter,
+            event_queue=self.event_queue,
+            interrupt_cb=self.interrupt,
+            stall_threshold_s=self.stall_threshold_s,
+            heartbeat_s=self.heartbeat_s,
+        ):
+            return await self.adapter.consume(self._client.receive_response())
 
     # ── Delegated capabilities (from ClaudeSDKClient) ───────────────
 
