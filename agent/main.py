@@ -973,7 +973,12 @@ async def _handle_slash_command(
     return None
 
 
-async def main(enable_hf_infra: bool | None = None, backend: str | None = None):
+async def main(
+    enable_hf_infra: bool | None = None,
+    backend: str | None = None,
+    resume_session_id: str | None = None,
+    fork_on_resume: bool = False,
+):
     """Interactive chat with the agent"""
 
     # Clear screen
@@ -1050,6 +1055,8 @@ async def main(enable_hf_infra: bool | None = None, backend: str | None = None):
             local_mode=True,
             stream=True,
             backend=config.backend,
+            resume_session_id=resume_session_id,
+            fork_on_resume=fork_on_resume,
         )
     )
 
@@ -1219,6 +1226,8 @@ async def headless_main(
     stream: bool = True,
     enable_hf_infra: bool | None = None,
     backend: str | None = None,
+    resume_session_id: str | None = None,
+    fork_on_resume: bool = False,
 ) -> None:
     """Run a single prompt headlessly and exit."""
     import logging
@@ -1277,6 +1286,8 @@ async def headless_main(
             local_mode=True,
             stream=stream,
             backend=config.backend,
+            resume_session_id=resume_session_id,
+            fork_on_resume=fork_on_resume,
         )
     )
 
@@ -1474,7 +1485,25 @@ def cli():
             "--enable-hf-infra."
         ),
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Resume an SDK-backed session in this directory. Auto-picks if "
+            "exactly one is found, else shows a menu. Forks on resume so the "
+            "original conversation is preserved; if the chosen session ended "
+            "in a wedged state (an unfinished tool call) the orphan turn is "
+            "dropped automatically. SDK backend only; sessions started before "
+            "this feature shipped cannot be resumed (no recorded sdk_session_id)."
+        ),
+    )
     args = parser.parse_args()
+
+    # Resume implies SDK backend (only path that supports it).
+    if args.resume and args.backend is None:
+        args.backend = "sdk"
+    if args.resume and args.backend != "sdk":
+        parser.error("--resume is only supported with --backend sdk")
 
     # SDK backend is local-first by default: if the user didn't explicitly
     # set --enable-hf-infra / --no-hf-infra, pick --no-hf-infra for them.
@@ -1485,6 +1514,37 @@ def cli():
     # and wait for HF token prompts.
     if args.backend == "sdk":
         _check_sdk_prerequisites()
+
+    # Resolve resume choice before clearing the screen / starting the loop.
+    resume_session_id: str | None = None
+    fork_on_resume: bool = False
+    if args.resume:
+        from agent.core.sdk_resume import (
+            discover_sessions,
+            prepare_resume,
+            select_session_interactive,
+        )
+        sessions = discover_sessions(Path.cwd())
+        if not sessions:
+            print("No resumable ml-intern sessions found in this directory.")
+            print("(Sessions started before --resume support shipped cannot "
+                  "be resumed — they were never tagged with an SDK session id.)")
+            sys.exit(1)
+        chosen = select_session_interactive(sessions)
+        if chosen is None:
+            print("Resume cancelled.")
+            sys.exit(0)
+        fork = prepare_resume(chosen)
+        resume_session_id = fork.resume_session_id
+        fork_on_resume = fork.used_fork_session
+        if fork.truncated_messages_dropped:
+            print(
+                f"Forked from {chosen.sdk_session_id} → {fork.resume_session_id} "
+                f"(dropped {fork.truncated_messages_dropped} record(s) from a "
+                f"wedged tail)."
+            )
+        else:
+            print(f"Resuming {chosen.sdk_session_id} (forked).")
 
     try:
         if args.prompt:
@@ -1499,6 +1559,8 @@ def cli():
                     stream=not args.no_stream,
                     enable_hf_infra=args.enable_hf_infra,
                     backend=args.backend,
+                    resume_session_id=resume_session_id,
+                    fork_on_resume=fork_on_resume,
                 )
             )
         else:
@@ -1506,6 +1568,8 @@ def cli():
                 main(
                     enable_hf_infra=args.enable_hf_infra,
                     backend=args.backend,
+                    resume_session_id=resume_session_id,
+                    fork_on_resume=fork_on_resume,
                 )
             )
     except KeyboardInterrupt:

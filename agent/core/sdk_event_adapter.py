@@ -68,6 +68,9 @@ class SDKEventAdapter:
         # is_error ResultMessage to `interrupted` instead of `error`
         # (Spike 6 finding: post-interrupt stop_reason=None, is_error=True).
         self._interrupt_pending = False
+        # Captured from the first `init` SystemMessage. Resume needs this id
+        # to look up the right JSONL under ~/.claude/projects/<cwd>/.
+        self.sdk_session_id: str | None = None
 
     def mark_interrupted(self) -> None:
         """Signal the adapter that a user-initiated interrupt just fired.
@@ -101,6 +104,9 @@ class SDKEventAdapter:
 
     async def _handle_system(self, msg: SystemMessage) -> None:
         if msg.subtype == "init":
+            sid = msg.data.get("session_id") if isinstance(msg.data, dict) else None
+            if isinstance(sid, str) and sid:
+                self.sdk_session_id = sid
             # SDK reports ALL tools available: Claude Code builtins
             # (Bash/Read/Edit/TodoWrite/WebFetch/…), any MCP plugins the
             # user has installed (Asana, Gmail, Notion, Sentry, …), AND

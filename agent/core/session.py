@@ -192,8 +192,12 @@ class Session:
 
     def get_trajectory(self) -> dict:
         """Serialize complete session trajectory for logging"""
+        sdk_session_id = None
+        if self.sdk_backend is not None:
+            sdk_session_id = getattr(self.sdk_backend, "sdk_session_id", None)
         return {
             "session_id": self.session_id,
+            "sdk_session_id": sdk_session_id,
             "session_start_time": self.session_start_time,
             "session_end_time": datetime.now().isoformat(),
             "model_name": self.config.model_name,

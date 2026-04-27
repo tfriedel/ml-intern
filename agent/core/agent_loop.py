@@ -1208,6 +1208,8 @@ async def submission_loop(
     local_mode: bool = False,
     stream: bool = True,
     backend: str = "litellm",
+    resume_session_id: str | None = None,
+    fork_on_resume: bool = False,
 ) -> None:
     """
     Main agent loop - processes submissions and dispatches to handlers.
@@ -1259,6 +1261,8 @@ async def submission_loop(
                     system_prompt=system_prompt,
                     max_turns=session.config.max_iterations if session.config.max_iterations > 0 else 500,
                     tool_router=tool_router,
+                    resume_session_id=resume_session_id,
+                    fork_on_resume=fork_on_resume,
                 )
                 await sdk_backend.connect()
                 session.sdk_backend = sdk_backend

@@ -275,6 +275,8 @@ class SDKBackend:
         ) = None,
         env: dict[str, str] | None = None,
         tool_router: Any | None = None,
+        resume_session_id: str | None = None,
+        fork_on_resume: bool = False,
     ):
         self.event_queue = event_queue
         self.config = config
@@ -284,6 +286,12 @@ class SDKBackend:
         self.env = env or {}
         self.tool_router = tool_router
         self.adapter = SDKEventAdapter(event_queue)
+        # When set, the backing ClaudeSDKClient resumes the named SDK
+        # session id from ~/.claude/projects/<encoded-cwd>/<id>.jsonl.
+        # `fork_on_resume=True` asks the SDK to mint a fresh session id
+        # rooted on the resumed history (preserves the original JSONL).
+        self._resume_session_id = resume_session_id
+        self._fork_on_resume = fork_on_resume
 
         # Build in-process MCP server from the ml-intern tool specs.
         # Specs with handler=None (external MCP tools fetched by
@@ -314,7 +322,7 @@ class SDKBackend:
         self._client: ClaudeSDKClient | None = None
 
     def _build_options(self) -> ClaudeAgentOptions:
-        return ClaudeAgentOptions(
+        kwargs: dict[str, Any] = dict(
             system_prompt=self.system_prompt,
             mcp_servers={"ml-intern": self._server},
             # NB: NOT setting `allowed_tools` — that would pre-approve
@@ -325,6 +333,17 @@ class SDKBackend:
             max_turns=self.max_turns,
             env=self.env,
         )
+        if self._resume_session_id:
+            kwargs["resume"] = self._resume_session_id
+            kwargs["fork_session"] = self._fork_on_resume
+        return ClaudeAgentOptions(**kwargs)
+
+    @property
+    def sdk_session_id(self) -> str | None:
+        """The active SDK session id (set after the first turn). For new
+        sessions this is whatever the SDK minted; for forked resumes this
+        is the new id under which the forked history is being written."""
+        return self.adapter.sdk_session_id
 
     # ── Lifecycle ───────────────────────────────────────────────────
 
